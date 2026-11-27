@@ -144,6 +144,9 @@ Each client in `clients/` has its own toolchain and CI check:
 
 - Use conventional prefixes: `feat:`, `fix:`, `docs:`, `test:`, `refactor:`, `chore:`
 - Keep PRs focused and link the related issue (for example, `Closes #123`).
+- Paging loops must stop once a page's highest ledger passes the covered `endLedger`, must drop events above `endLedger`, and must not hold an unbounded number of pages in memory; prefer a small page budget or return per page so the caller can persist between pages.
+- Treat a page as drained only when the provider returns fewer events than requested is not a safe signal; verify against the provider's actual returned count and cursor, not the requested limit alone.
+- Bug fixes for cursor or paging behaviour must include mocked-RPC tests covering the second page (not lost) and asserting `highestLedger` never exceeds `endLedger`.
 
 ## Before opening a PR
 
