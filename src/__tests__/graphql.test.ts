@@ -5,6 +5,7 @@ import path from "path";
 import request from "supertest";
 import { createApp } from "../api";
 import { resetPersistedQueryCache } from "../graphql/persisted";
+import { persistQueryFiles } from "../graphql/persist-queries";
 
 jest.mock("../db", () => ({
   getAccountSummary: jest.fn().mockResolvedValue([]),
@@ -100,4 +101,29 @@ describe("GraphQL server plugins", () => {
     expect(res.body.errors).toBeUndefined();
     expect(res.body.data.health.ok).toBe(true);
   });
+
+  it("runs a query persisted by graphql:persist in production", async () => {
+    process.env.NODE_ENV = "production";
+
+    const query = "{ health { ok } }";
+    const tempDir = mkdtempSync(path.join(tmpdir(), "wraith-persisted-"));
+    tempDirs.push(tempDir);
+
+    const queryFile = path.join(tempDir, "health.graphql");
+    writeFileSync(queryFile, `${query}\n`);
+    const outPath = path.join(tempDir, "persisted-queries.json");
+    persistQueryFiles([queryFile], outPath);
+
+    process.env.PERSISTED_QUERIES_PATH = outPath;
+    resetPersistedQueryCache();
+
+    const hash = createHash("sha256").update(query).digest("hex");
+    const res = await request(createApp())
+      .post("/graphql")
+      .send({ extensions: { persistedQuery: { sha256Hash: hash } } });
+
+    expect(res.body.errors).toBeUndefined();
+    expect(res.body.data.health.ok).toBe(true);
+  });
 });
+

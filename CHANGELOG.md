@@ -17,6 +17,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Discord roles bot: `DISCORD_RECHECK_TICK_MS`, `DISCORD_ABSENT_CHECKS_BEFORE_BACKOFF`, `DISCORD_ABSENT_RECHECK_INTERVAL_MS` and `DISCORD_MAX_FAILURE_BACKOFF_MS`.
 
 ### Changed
+- **Provider order statuses are read by whole word, and a still-moving word always wins** (#418). `isFailureStatus`, `statusForClients`/`billStatusForClients` and `terminalStatusOf` now share one classifier (`src/linq/providerStatus.ts`). A `refund_pending`, `refund_processing`, `cancel_requested`, `reversal_pending` or `awaiting_refund` order no longer writes a `MoneyFailure` row or reaches wallet apps as finished; it is sent exactly as the provider wrote it. A status no rule knows is passed through unchanged and counted nowhere. Every real ending returns exactly what it did before, pinned by a table test.
 - **`GET /accounts/{address}/summary` says what it answers, and the spec describes it.** Two changes a client can see:
   - `displayNet` is now a plain signed decimal (`"-0.0000500"`). It used to be `"-0.0000500 (negative)"` — a number with a word glued onto the end, which every client had to strip before formatting and which no other display field in the API does.
   - `fromDate` and `toDate` are refused with `400`. They were accepted and ignored: the route reads a materialised rollup of one all-time row per asset, so there was no window to filter and a caller who asked for a month was given everything. `GET /summary/{address}` is the route that takes a window, and it is unchanged.

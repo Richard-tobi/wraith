@@ -52,35 +52,53 @@ const mockCreateManyAndReturn = jest.fn(async (args: CreateManyAndReturnArgs) =>
   return inserted;
 });
 
-const mockExecuteRaw = jest.fn(
-  async (_strings: TemplateStringsArray, ...values: unknown[]) => {
-    // Mirror the exact parameter order of upsertAccountSummaries in src/db.ts:
-    // networkName, address, contractId, sentStr, receivedStr, netStr, count, lastAt
-    const [networkName, address, contractId, sentStr, receivedStr, , count] = values as [
-      Network,
-      string,
-      string,
-      string,
-      string,
-      string,
-      number,
-    ];
-    const key = `${networkName}:${address}:${contractId}`;
-    const prev = mockAccountSummaries.get(key) ?? {
-      network: networkName,
-      sent: 0n,
-      received: 0n,
-      txCount: 0,
-    };
-    mockAccountSummaries.set(key, {
-      network: networkName,
-      sent: prev.sent + BigInt(sentStr),
-      received: prev.received + BigInt(receivedStr),
-      txCount: prev.txCount + count,
-    });
-    return 1;
-  },
-);
+type SqlLike = { strings: readonly string[]; values: unknown[] };
+
+/**
+ * Mirror the arithmetic of `upsertAccountSummaries` in src/db.ts for one row.
+ * The bound parameters of a row are: networkName, address, contractId,
+ * totalSent, totalReceived, net, txCount, lastActivityAt (`net` and
+ * `lastActivityAt` are recomputed or compared, never accumulated).
+ */
+function applySummaryRow(values: unknown[]) {
+  const [networkName, address, contractId, sentStr, receivedStr, , count] = values as [
+    Network,
+    string,
+    string,
+    string,
+    string,
+    string,
+    number,
+  ];
+  const key = `${networkName}:${address}:${contractId}`;
+  const prev = mockAccountSummaries.get(key) ?? {
+    network: networkName,
+    sent: 0n,
+    received: 0n,
+    txCount: 0,
+  };
+  mockAccountSummaries.set(key, {
+    network: networkName,
+    sent: prev.sent + BigInt(sentStr),
+    received: prev.received + BigInt(receivedStr),
+    txCount: prev.txCount + count,
+  });
+}
+
+const mockExecuteRaw = jest.fn(async (query: unknown) => {
+  // Since #450 the totals go out as one multi-row statement per chunk: the
+  // statement binds the row list, and each row is its own Prisma.Sql carrying
+  // that row's parameters. Anything else is treated as a single flat row.
+  const statement = (query ?? {}) as SqlLike;
+  const bound = Array.isArray(statement.values) ? statement.values : [];
+  const batch = bound[0];
+  const rows: Array<{ values: unknown[] }> = Array.isArray(batch)
+    ? (batch as Array<{ values: unknown[] }>)
+    : [{ values: bound }];
+
+  for (const row of rows) applySummaryRow(row.values);
+  return rows.length;
+});
 
 jest.mock("@prisma/client", () => ({
   PrismaClient: jest.fn().mockImplementation(() => ({
@@ -98,6 +116,10 @@ jest.mock("@prisma/client", () => ({
     indexerState: {
       upsert: jest.fn(async () => undefined),
     },
+    // The batch upsert wraps every chunk in one transaction (#450).
+    $transaction: jest.fn((ops: unknown) =>
+      Array.isArray(ops) ? Promise.all(ops) : Promise.reject(new Error("interactive transaction not mocked"))
+    ),
     $executeRaw: mockExecuteRaw,
     $queryRaw: jest.fn(async () => []),
     $on: jest.fn(),
