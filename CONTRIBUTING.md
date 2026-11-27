@@ -13,7 +13,7 @@ Wraith is a Soroban incoming token transfer indexer and API for Stellar, with op
 ```
 wraith/
 ├── src/
-│   ├── index.ts          # Service entry point (env validation, schema push, server + indexer startup)
+│   ├── index.ts          # Service entry point (env validation, schema push, server + indexer startup; `startAllIndexers()` runs unless `SKIP_INDEXER=true`, and the exported graceful drain helper is covered by tests against this real module)
 │   ├── api.ts            # Express app, middleware order, and core REST endpoints
 │   ├── api/              # Feature routers (accounts, candles, fees, ngn, offramp, ops, webhooks)
 │   ├── routes/           # Modular read, export, and search routes
