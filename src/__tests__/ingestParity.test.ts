@@ -55,6 +55,15 @@ jest.mock("../db", () => ({
     }
     return added;
   }),
+  upsertTransfersReturning: jest.fn(async (records: Row[]) => {
+    const inserted: Row[] = [];
+    for (const r of records) {
+      if (mockStore.transfers.has(String(r.eventId))) continue;
+      mockStore.transfers.set(String(r.eventId), { ...r });
+      inserted.push(r);
+    }
+    return inserted;
+  }),
   // Aggregated per (address, contract), so the result does not depend on the
   // order or grouping of batches, only on which records reached it.
   upsertAccountSummaries: jest.fn(async (records: Row[]) => {

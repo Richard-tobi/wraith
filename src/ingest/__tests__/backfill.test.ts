@@ -21,6 +21,7 @@ jest.mock("../../db", () => ({
   setBackfillCursor: jest.fn(),
   clearBackfillCursor: jest.fn(),
   upsertTransfers: jest.fn(async () => 0),
+  upsertTransfersReturning: jest.fn(async () => []),
   upsertAccountSummaries: jest.fn(async () => undefined),
   upsertNftTransfers: jest.fn(async () => 0),
   getNftMetadata: jest.fn(async () => null),
@@ -50,6 +51,7 @@ import {
   setBackfillCursor,
   clearBackfillCursor,
   upsertTransfers,
+  upsertTransfersReturning,
   type BackfillCursorState,
 } from "../../db";
 import { DEFAULT_XLM_SAC_TESTNET } from "../../indexer";
@@ -59,6 +61,9 @@ const mockGetBackfillCursor = getBackfillCursor as jest.MockedFunction<typeof ge
 const mockSetBackfillCursor = setBackfillCursor as jest.MockedFunction<typeof setBackfillCursor>;
 const mockClearBackfillCursor = clearBackfillCursor as jest.MockedFunction<typeof clearBackfillCursor>;
 const mockUpsertTransfers = upsertTransfers as jest.MockedFunction<typeof upsertTransfers>;
+const mockUpsertTransfersReturning = upsertTransfersReturning as jest.MockedFunction<
+  typeof upsertTransfersReturning
+>;
 const mockValidateNetworkConfig = validateNetworkConfig as jest.MockedFunction<typeof validateNetworkConfig>;
 const mockCreateSourceSwitcher = createSourceSwitcherWithConfig as jest.MockedFunction<
   typeof createSourceSwitcherWithConfig
@@ -208,6 +213,7 @@ describe("runBackfill", () => {
     await runBackfill({ fromLedger: 300, toLedger: 400, force: false });
 
     expect(mockUpsertTransfers).not.toHaveBeenCalled();
+    expect(mockUpsertTransfersReturning).not.toHaveBeenCalled();
     expect(mockClearBackfillCursor).not.toHaveBeenCalled();
   });
 
@@ -229,6 +235,7 @@ describe("runBackfill", () => {
     await runBackfill({ fromLedger: 1, toLedger: 1000, chunkSize: 10, signal });
 
     expect(mockUpsertTransfers).not.toHaveBeenCalled();
+    expect(mockUpsertTransfersReturning).not.toHaveBeenCalled();
   });
 
   it("does not call IndexerState functions", async () => {

@@ -126,6 +126,35 @@ balance can differ from the on-chain balance.
 
 Options: `wraith.WithHTTPClient(*http.Client)` and `wraith.WithHeader(k, v)`.
 
+## Coverage
+
+What the Go client reaches today, against the whole API. `✅` the group in full,
+`◐` part of it, `—` none of it. Know this before installing: a gap here means
+hand-rolling `net/http` against a documented route.
+
+| Group                | Go    | Gap                                                              |
+| -------------------- | :---: | ---------------------------------------------------------------- |
+| Transfers            | ✅    |                                                                   |
+| Accounts             | ✅    |                                                                   |
+| Windowed summary     | —     | `GET /summary/{address}` uncovered                                |
+| Assets               | ✅    |                                                                   |
+| NFTs                 | ✅    |                                                                   |
+| Status               | ✅    |                                                                   |
+| Token directory      | ✅    |                                                                   |
+| Host-fn logs         | ✅    |                                                                   |
+| Webhooks             | ◐     | `List`, `Deliveries` only — no `POST /webhooks`, no delete         |
+| Search               | ✅    |                                                                   |
+| Candles, fees, offramp, NGN rails | — | #308                                                     |
+| Exports, ops, liveness, bot and provider callbacks, GraphQL | — | deliberate               |
+
+The full table — every client, and why each gap is open or deliberate — is
+[docs/client-coverage.md](../../docs/client-coverage.md). Change this row and
+that row in the same PR.
+
+Two per-client gaps sit outside that table because they are about how the calls
+behave, not which routes exist: the client cannot select a network or filter a
+summary (#412), and it drops the API's error code (#410).
+
 ## Development
 
 ```bash

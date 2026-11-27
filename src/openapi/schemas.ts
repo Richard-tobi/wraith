@@ -289,6 +289,36 @@ export const summaryResponseSchema = z.object({
   tokens: z.array(tokenSummarySchema),
 });
 
+/**
+ * An amount a person reads, in major units, signed.
+ *
+ * A minus sign is how a negative reads — `displayNetFlow` and every
+ * `displayAmount` already do it this way, and a field whose sign is a word in
+ * the string ("5.0000000 (negative)") is a field no client can format without
+ * special-casing it.
+ */
+const signedDisplayAmountSchema = z
+  .string()
+  .regex(/^-?\d+(\.\d+)?$/, "display amounts are a plain signed decimal, with no words in them");
+
+/** One asset the address has ever touched, as the account summary serves it. */
+export const accountAssetSummarySchema = z.object({
+  contractId: contractAddressSchema,
+  totalSent: z.string(),
+  totalReceived: z.string(),
+  net: z.string(),
+  displayTotalSent: signedDisplayAmountSchema,
+  displayTotalReceived: signedDisplayAmountSchema,
+  displayNet: signedDisplayAmountSchema,
+  txCount: z.number().int(),
+  lastActivityAt: isoDateTimeSchema,
+});
+
+export const accountSummaryResponseSchema = z.object({
+  address: stellarAddressSchema,
+  assets: z.array(accountAssetSummarySchema),
+});
+
 export const webhookFilterSchema = z
   .object({
     contract: z.string().optional(),
@@ -497,6 +527,22 @@ export const summaryQuerySchema = z.object({
   contractId: optionalQueryString("Token contract ID to filter by"),
   fromDate: optionalQueryDateTime("Inclusive lower bound on ledgerClosedAt"),
   toDate: optionalQueryDateTime("Inclusive upper bound on ledgerClosedAt"),
+}).passthrough();
+
+/**
+ * What `GET /accounts/{address}/summary` takes.
+ *
+ * Narrower than {@link summaryQuerySchema} on purpose. That route computes over
+ * the transfer rows and can honour a date window; this one reads the
+ * materialised `AccountSummary` rollup, which holds one all-time row per asset
+ * and has no window to filter. The route rejects `fromDate` and `toDate`
+ * explicitly, but unrelated query parameters pass through for compatibility
+ * with installed apps that add their own.
+ */
+export const accountSummaryQuerySchema = z.object({
+  ...withNetwork,
+  address: stellarAddressSchema,
+  contractId: optionalQueryString("Token contract ID to filter by"),
 }).passthrough();
 
 export const txHashParamsSchema = z.object({
@@ -719,9 +765,9 @@ export const offrampTrustlineResponseSchema = z.object({
 
 export const offrampOrderBodySchema = z
   .object({
-    /** Exactly one of amountNGN / amountStableCoin. */
-    amountNGN: z.number().optional(),
-    amountStableCoin: z.number().optional(),
+    /** Exactly one of amountNGN / amountStableCoin. Accepts a plain number or a decimal string (e.g. "50.00"). */
+    amountNGN: z.union([z.number(), z.string()]).optional(),
+    amountStableCoin: z.union([z.number(), z.string()]).optional(),
     bankAccount: z.string().min(1),
     bankCode: z.string().min(1),
     bankName: z.string().min(1),
@@ -735,16 +781,43 @@ export const offrampOrderBodySchema = z
   .passthrough();
 
 export const offrampOrderStatus = z
-  .enum(["pending", "waiting_for_deposit", "processing", "completed", "failed", "expired"])
-  .openapi({ description: "Client-facing status mapped from the provider's raw one." });
+  .string()
+  .openapi({
+    description:
+      "Client-facing status. The server sends the provider's own word (e.g. `initiated`, " +
+      "`processing`, `settled`, `disbursed`, `failed`, `expired`, `refunded`, `cancelled`), " +
+      "sometimes with a suffix appended for older wallet builds that only recognise a small " +
+      "vocabulary: an expiry becomes `<raw> (timeout)` and a refund, cancel or reversal " +
+      "becomes `<raw> (failed)`. The raw provider word is always in `providerStatus`. " +
+      "To test whether an order has failed, check `providerStatus` against the provider's " +
+      "known terminal words rather than substring-matching this field — substrings are " +
+      "unreliable because words like `refund_pending` contain `refund`.",
+    example: "settled",
+  });
 
 export const offrampOrderResponseSchema = z.object({
-  id: z.string(),
+  id: z.string().openapi({
+    description:
+      "Client-facing order id. Format: `ofr_` followed by 22 URL-safe characters (128 bits). " +
+      "Never the provider's internal id.",
+    example: "ofr_<22 URL-safe characters>",
+  }),
+  accessToken: z.string().openapi({
+    description:
+      "Bearer credential that authorises reading this order. Format: `oft_` followed by " +
+      "43 URL-safe characters (256 bits). Shown exactly once — only its SHA-256 is stored. " +
+      "On a replay the previous token is invalidated and a new one is issued.",
+    example: "oft_<43 URL-safe characters>",
+  }),
   walletAddress: z.string().openapi({ description: "Deposit address the stablecoin is sent to." }),
   chain: z.string(),
   coin: z.string(),
-  amountStableCoin: z.number(),
-  amountNGN: z.number(),
+  amountStableCoin: z.number().openapi({
+    description: "Stablecoin amount.",
+  }),
+  amountNGN: z.number().openapi({
+    description: "Naira amount.",
+  }),
   rate: z.number(),
   status: offrampOrderStatus,
   providerStatus: z.string().optional().openapi({ description: "Raw provider status, when the order is not a replay." }),
@@ -760,8 +833,12 @@ export const offrampOrderStatusResponseSchema = z.object({
   id: z.string(),
   status: offrampOrderStatus,
   providerStatus: z.string(),
-  amountStableCoin: z.number(),
-  amountNGN: z.number(),
+  amountStableCoin: z.number().openapi({
+    description: "Stablecoin amount.",
+  }),
+  amountNGN: z.number().openapi({
+    description: "Naira amount.",
+  }),
   depositAddress: z.string(),
   rate: z.number(),
   createdAt: z.string().datetime({ offset: true }),

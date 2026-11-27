@@ -69,6 +69,16 @@ jest.mock("../../db", () => ({
     }
     return added;
   }),
+  upsertTransfersReturning: jest.fn(async (records: Row[], net: Network = "testnet") => {
+    const inserted: Row[] = [];
+    for (const r of records) {
+      const key = `${net}:${String(r.eventId)}`;
+      if (mockStore.transfers.has(key)) continue;
+      mockStore.transfers.set(key, { ...r, network: net });
+      inserted.push(r);
+    }
+    return inserted;
+  }),
   upsertAccountSummaries: jest.fn(async (records: Row[], net: Network = "testnet") => {
     for (const r of records) {
       for (const [address, side] of [[r.toAddress, "in"], [r.fromAddress, "out"]] as const) {
