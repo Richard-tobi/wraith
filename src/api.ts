@@ -2,6 +2,7 @@ import express, { Request, Response, NextFunction } from "express";
 import rateLimit from "express-rate-limit";
 import { jsonApiMiddleware } from "./middleware/jsonapi";
 import { createCorsMiddleware } from "./middleware/cors";
+import { requestId, type RequestWithId } from "./middleware/requestId";
 import { queryHostFnLogs } from "./indexer/host-fn-log";
 import { queryTransfers, queryAllTransfers, queryByTxHash, querySummary, queryNftTransfers, getNftOwner, getNftMetadata, getLastIndexedLedger, prisma } from "./db";
 import { getLatestLedger } from "./rpc";
@@ -48,8 +49,30 @@ import { getRoutePattern, indexRoutePatterns } from "./routePatterns";
 const cachedRpcHealth = new Map<Network, { healthy: boolean; timestamp: number }>();
 const RPC_HEALTH_CACHE_TTL_MS = 3000;
 
+// One probe per network at a time. The cache above only covers an answer that
+// has already arrived: when it expires under load, every request that arrives
+// before the next answer comes back used to make its own RPC call (#459). A
+// burst of concurrent reads now shares the probe that is already in flight, and
+// the answer — healthy or not — is cached when it lands.
+const inFlightRpcHealth = new Map<Network, Promise<boolean>>();
+
 export function clearRpcHealthCache(): void {
   cachedRpcHealth.clear();
+  inFlightRpcHealth.clear();
+}
+
+async function probeRpcHealth(net: Network): Promise<boolean> {
+  try {
+    const latest = await getLatestLedger(net);
+    const healthy = typeof latest === "number" && latest > 0;
+    cachedRpcHealth.set(net, { healthy, timestamp: Date.now() });
+    return healthy;
+  } catch {
+    // A failure is cached for the same three seconds as a success: an RPC that
+    // is down should not be re-probed on every request either.
+    cachedRpcHealth.set(net, { healthy: false, timestamp: Date.now() });
+    return false;
+  }
 }
 
 export async function checkRpcHealth(network?: Network): Promise<boolean> {
@@ -60,15 +83,19 @@ export async function checkRpcHealth(network?: Network): Promise<boolean> {
     return cached.healthy;
   }
 
-  try {
-    const latest = await getLatestLedger(net);
-    const healthy = typeof latest === "number" && latest > 0;
-    cachedRpcHealth.set(net, { healthy, timestamp: now });
-    return healthy;
-  } catch {
-    cachedRpcHealth.set(net, { healthy: false, timestamp: now });
-    return false;
+  const inFlight = inFlightRpcHealth.get(net);
+  if (inFlight) {
+    return inFlight;
   }
+
+  const probe = probeRpcHealth(net);
+  inFlightRpcHealth.set(net, probe);
+  void probe.finally(() => {
+    if (inFlightRpcHealth.get(net) === probe) {
+      inFlightRpcHealth.delete(net);
+    }
+  });
+  return probe;
 }
 
 // ─── Rate limiting ─────────────────────────────────────────────────────────
@@ -146,6 +173,15 @@ export function createApp(): express.Application {
   // Render's X-Forwarded-For, nothing further back.
   app.set("trust proxy", 1);
 
+  // ─── Request id ───────────────────────────────────────────────────────────
+  // First, above everything that can answer: the two raw-body routers, CORS,
+  // the limiter, and the error handler at the bottom. An id that started after
+  // a router would leave the requests that router refuses — and every log line
+  // it wrote — without one, which is exactly the report a person files.
+  // It reads a header and writes a header, so it is safe above `express.json()`
+  // and above the signature-verifying webhook routes.
+  app.use(requestId);
+
   // ─── HTTP metrics middleware ──────────────────────────────────────────────
   // First in the chain, deliberately: mounted below networkMiddleware and the
   // rate limiter it would never see the requests those two reject, so a 429
@@ -217,31 +253,45 @@ export function createApp(): express.Application {
 
   // ─── Stale read middleware ──────────────────────────────────────────
   // Attaches X-Data-Stale and X-As-Of-Ledger headers plus `stale` / `as_of_ledger`
-  // body parameters when serving DB data during an RPC outage.
-  app.use(async (req: Request, res: Response, next: NextFunction) => {
-    // /metrics is served from in-process counters, so the RPC health probe
-    // below would add a network round-trip to every scrape and report nothing.
-    if (req.method !== "GET" || req.path === "/healthz" || req.path === "/metrics") {
-      return next();
-    }
+  // body parameters when serving indexed ledger data during an RPC outage.
+  //
+  // It works from the list below, not from a list of exceptions. RPC health says
+  // nothing about an answer that was never read from the chain: `/fees` is
+  // computed from environment variables, the webhook and Discord routes read
+  // their own records. Exclusion meant each of those waited on an RPC probe
+  // before its handler ran — on `/fees`, in the middle of a payment — and was
+  // then told its correct answer was stale whenever the RPC was down or the
+  // network had no indexer. The same mistake once made `/ngn/onramp/rate`
+  // return `{"rate":1437.45,"stale":true}` for a rate fetched seconds earlier;
+  // `/ngn` also uses `stale: true` to mean "Linq was unreachable", which this
+  // middleware must never have said for it.
+  //
+  // So a route is stale-marked only if it is on the list. A new router is
+  // untouched unless it is added here on purpose.
+  const INDEXED_DATA_PATHS = [
+    "/status",
+    "/readyz",
+    "/transfers",
+    "/summary",
+    "/accounts",
+    "/assets",
+    "/search",
+    "/nfts",
+    "/host-fn",
+    "/tokens",
+    "/graphql",
+    // The export router is mounted at "/", so its downloads are not under the
+    // /transfers prefix and need naming individually.
+    "/transfers.csv",
+    "/transfers.parquet",
+  ];
 
-    // The naira rails answer from Linq, not from indexed ledger data, so RPC
-    // health says nothing about whether their answer is current. Marking a live
-    // exchange rate `stale` because mainnet has no indexer configured is simply
-    // untrue — `/ngn/onramp/rate` was returning `{"rate":1437.45,"stale":true}`
-    // for a rate fetched seconds earlier.
-    //
-    // It also collides with a flag these routes already set for a different
-    // meaning: `/ngn` marks `stale: true` for "Linq was unreachable, this is
-    // our last known record". Letting this middleware write the same key would
-    // have the app tell people the payment provider is down while it is
-    // answering perfectly well.
-    //
-    // `/ops` joins them for a simpler reason: it reads failure records, not
-    // chain data. RPC health says nothing about whether its answer is current,
-    // and stamping `stale: true` onto an operator's incident list during an
-    // RPC outage is noise at exactly the wrong moment.
-    if (req.path.startsWith("/ngn") || req.path.startsWith("/offramp") || req.path.startsWith("/ops")) {
+  /** Segment-aware: `/summaries` is not `/summary`. */
+  const servesIndexedData = (path: string): boolean =>
+    INDEXED_DATA_PATHS.some((prefix) => path === prefix || path.startsWith(`${prefix}/`));
+
+  app.use(async (req: Request, res: Response, next: NextFunction) => {
+    if (req.method !== "GET" || !servesIndexedData(req.path)) {
       return next();
     }
 
@@ -557,11 +607,10 @@ export function createApp(): express.Application {
           ...stats,
           networks: byNetwork,
           dependencies,
-    dependency_status_bound_ms: dependencyStatusBoundMs,
-    cache: cacheStatus(),
-  });
-} 
-else {
+          dependency_status_bound_ms: dependencyStatusBoundMs,
+          cache: cacheStatus(),
+        });
+      } else {
         res.setHeader("X-Data-Stale", "true");
         if (lastIndexedLedger !== null) {
           res.setHeader("X-As-Of-Ledger", String(lastIndexedLedger));
@@ -938,6 +987,11 @@ else {
   /**
    * Aggregate token stats for `address`, grouped by contractId.
    *
+   * Computed over the transfer rows, which is what makes the date window below
+   * mean something. `GET /accounts/:address/summary` is the other question —
+   * one all-time row per asset, read from the materialised rollup — and it
+   * refuses these two parameters rather than ignoring them.
+   *
    * Query params:
    *   contractId  — filter to a specific token contract
    *   fromDate    — ISO 8601 inclusive lower bound on ledgerClosedAt
@@ -992,8 +1046,10 @@ else {
       }
     };
 
+  // Only this path. `/accounts/:address/summary` is the accounts router's, which
+  // mounts first and answers a different question (all-time, per asset); this
+  // second registration sat below it and could never run.
   app.get("/summary/:address", summaryHandler);
-  app.get("/accounts/:address/summary", summaryHandler);
 
   // ─── GET /host-fn/:contractId ────────────────────────────────────────────
   /**
@@ -1153,7 +1209,7 @@ else {
   });
 
   // ─── Global error handler ────────────────────────────────────────────────
-  app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
     // A deliberately-thrown HttpError carries a message written for the caller,
     // so it keeps its own status and text.
     if (err instanceof HttpError) {
@@ -1162,10 +1218,6 @@ else {
         .json({ error: err.message, code: err.status >= 500 ? "internal_error" : "invalid_request" });
     }
 
-    // Anything else is unhandled, and its message is not ours to show. This
-    // handler used to answer `err.message` verbatim, which is how a Postgres
-    // connection string reached callers through a raw driver error. The caller
-    // gets a correlation id; the detail stays in the log.
     // A body the parser could not read is the caller's mistake, not ours. Its
     // error object carries the whole raw body, which can hold a national ID
     // number or bank details, so only the failure type is logged.
@@ -1177,7 +1229,11 @@ else {
         .json({ error: "The request body could not be read", code: "invalid_request" });
     }
 
-    const correlationId = newCorrelationId();
+    // The id is the one the request already has, not a fresh one: a person
+    // reporting a failed cash-out quotes the id on the screen, and the provider
+    // call that failed wrote its log lines under that same id. Minting a second
+    // id here meant the report and the logs never met.
+    const correlationId = (req as RequestWithId).requestId ?? newCorrelationId();
     // Never the raw error: libraries hang request data on their errors.
     console.error(`[api] Unhandled error (${correlationId}):`, loggableError(err));
 

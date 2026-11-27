@@ -63,6 +63,8 @@ jest.mock("../graphql/server", () => ({
 import { createApp } from "../api";
 import { bodyParseFailure, loggableError } from "../utils/bodyError";
 
+const { queryTransfers } = require("../db");
+
 // A stand-in for something private. Not a real identifier of any kind.
 const MARKER = "PRIVATE-MARKER-0000";
 
@@ -115,6 +117,30 @@ describe("an unreadable request body", () => {
       .send(`{"value":"${MARKER}",`);
 
     expect(logged(error, warn, log)).not.toContain(MARKER);
+  });
+
+  it("logs an unhandled error without request data attached to it", async () => {
+    queryTransfers.mockRejectedValueOnce(
+      Object.assign(new Error("driver failed"), {
+        body: MARKER,
+        config: { headers: { authorization: MARKER } },
+      }),
+    );
+
+    const res = await request(createApp())
+      .get("/transfers/incoming/GABCDEF")
+      .set("x-request-id", "driver-request");
+
+    expect(res.status).toBe(500);
+    expect(res.body.correlationId).toBe("driver-request");
+    expect(logged(error, warn, log)).not.toContain(MARKER);
+    expect(logged(error, warn, log)).toContain("driver-request");
+    expect(error).toHaveBeenCalledWith(
+      expect.stringContaining("driver-request"),
+      expect.objectContaining({ name: "Error", message: "driver failed" }),
+    );
+    expect(error.mock.calls[0][1]).not.toHaveProperty("body");
+    expect(error.mock.calls[0][1]).not.toHaveProperty("config");
   });
 });
 

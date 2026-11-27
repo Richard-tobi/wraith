@@ -133,79 +133,115 @@ export interface RawEvent {
 
 // ─── getEvents wrapper ────────────────────────────────────────────────────────
 /**
+ * Stellar RPC `getEvents` filter limits:
+ * - At most 5 contract IDs per filter (`protocol.MaxContractIDsLimit = 5`)
+ * - At most 5 filters per request (`protocol.MaxFiltersLimit = 5`), covering up
+ *   to 25 contracts in a single `getEvents` call.
+ *
+ * Sources:
+ * - Stellar RPC `getEvents` reference:
+ *   https://developers.stellar.org/docs/data/apis/rpc/api-reference/methods/getEvents
+ * - `stellar-rpc` server validation (`protocol.MaxFiltersLimit`,
+ *   `protocol.MaxContractIDsLimit`).
+ */
+export const MAX_CONTRACT_IDS_PER_FILTER = 5;
+export const MAX_FILTERS_PER_REQUEST = 5;
+export const MAX_CONTRACTS_PER_REQUEST =
+  MAX_CONTRACT_IDS_PER_FILTER * MAX_FILTERS_PER_REQUEST;
+
+/**
+ * Partition watched contract IDs into valid `getEvents` filter batches.
+ *
+ * Each filter holds at most {@link MAX_CONTRACT_IDS_PER_FILTER} contract IDs
+ * and each request batch holds at most {@link MAX_FILTERS_PER_REQUEST} filters.
+ * An empty list produces a single unfiltered contract event request (`planNetworks`
+ * already refuses to start an indexer loop with an empty watch list).
+ */
+export function buildEventFilterBatches(
+  contractIds: string[]
+): RPC.Api.EventFilter[][] {
+  if (contractIds.length === 0) {
+    // Only pass contractIds if the caller is watching specific contracts;
+    // omitting the field lets RPC return events for all contracts.
+    return [[{ type: "contract" }]];
+  }
+
+  const filters: RPC.Api.EventFilter[] = [];
+  for (let i = 0; i < contractIds.length; i += MAX_CONTRACT_IDS_PER_FILTER) {
+    filters.push({
+      type: "contract",
+      contractIds: contractIds.slice(i, i + MAX_CONTRACT_IDS_PER_FILTER),
+    });
+  }
+
+  const batches: RPC.Api.EventFilter[][] = [];
+  for (let i = 0; i < filters.length; i += MAX_FILTERS_PER_REQUEST) {
+    batches.push(filters.slice(i, i + MAX_FILTERS_PER_REQUEST));
+  }
+  return batches;
+}
+
+/**
  * Fetch contract events from Stellar RPC.
+ *
+ * Splits `contractIds` into filters of at most 5 IDs and requests of at most
+ * 5 filters (25 contracts per RPC call). Above 25 contracts, issues multiple
+ * requests for the same ledger range, merges events in stable event-id order,
+ * and returns the lowest `latestLedger` reached by any request so no batch's
+ * tail is skipped.
  *
  * @param startLedger  First ledger to include (inclusive).
  * @param contractIds  Filter to specific contract IDs. Pass [] to skip filter.
  * @param limit        Max events per call (RPC hard-caps at 10 000).
  * @param network      Which chain to read. Defaults to the configured network.
- * @param cursor       Optional paging cursor from a previous truncated page.
  */
 export async function fetchEvents(
   startLedger: number,
   contractIds: string[],
   limit: number = 10_000,
-  network?: Network,
-  cursor?: string
-): Promise<{
-  events: RawEvent[];
-  latestLedger: number;
-  cursor?: string;
-  maxEventLedger: number;
-  pageFull: boolean;
-}> {
+  network?: Network
+): Promise<{ events: RawEvent[]; latestLedger: number }> {
   const rpc = getRpc(network);
+  const filterBatches = buildEventFilterBatches(contractIds);
 
-  // Build the request using the correct Server.GetEventsRequest type.
-  // Api.EventFilter allows: type, contractIds (string[]), topics (string[][]).
-  // A paging cursor replaces startLedger; the RPC forbids both together.
-  const request = (cursor
-    ? {
-        cursor,
-        limit,
-        filters: [
-          {
-            type: "contract",
-            ...(contractIds.length > 0 ? { contractIds } : {}),
-          },
-        ],
-      }
-    : {
-        startLedger,
-        limit,
-        filters: [
-          {
-            type: "contract",
-            // Only pass contractIds if the caller is watching specific contracts;
-            // omitting the field lets RPC return events for all contracts.
-            ...(contractIds.length > 0 ? { contractIds } : {}),
-          },
-        ],
-      }) as RPC.Server.GetEventsRequest;
+  const allEvents: RawEvent[] = [];
+  let lowestLatestLedger = Infinity;
 
-  const resp = await rpc.getEvents(request);
+  for (const filters of filterBatches) {
+    // Build the request using the correct Server.GetEventsRequest type.
+    // Api.EventFilter allows: type, contractIds (string[]), topics (string[][]).
+    const request: RPC.Server.GetEventsRequest = {
+      startLedger,
+      limit,
+      filters,
+    };
 
-  // Api.EventResponse.contractId is Contract | undefined.
-  // Contract.contractId() returns the C... strkey string.
-  const events: RawEvent[] = (resp.events ?? []).map((e) => ({
-    id: e.id,
-    type: e.type,
-    ledger: e.ledger,
-    ledgerClosedAt: e.ledgerClosedAt,
-    // Unwrap Contract object → plain string address
-    contractId: e.contractId?.contractId() ?? "",
-    txHash: e.txHash,
-    topic: e.topic,
-    value: e.value,
-  }));
-  const maxEventLedger = events.reduce((m, e) => Math.max(m, e.ledger), 0);
-  return {
-    events,
-    latestLedger: resp.latestLedger,
-    cursor: resp.cursor || undefined,
-    maxEventLedger,
-    pageFull: events.length >= limit,
-  };
+    const resp = await rpc.getEvents(request);
+
+    // Api.EventResponse.contractId is Contract | undefined.
+    // Contract.contractId() returns the C... strkey string.
+    for (const e of resp.events ?? []) {
+      allEvents.push({
+        id: e.id,
+        type: e.type,
+        ledger: e.ledger,
+        ledgerClosedAt: e.ledgerClosedAt,
+        // Unwrap Contract object → plain string address
+        contractId: e.contractId?.contractId() ?? "",
+        txHash: e.txHash,
+        topic: e.topic,
+        value: e.value,
+      });
+    }
+
+    lowestLatestLedger = Math.min(lowestLatestLedger, resp.latestLedger);
+  }
+
+  if (filterBatches.length > 1) {
+    allEvents.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  }
+
+  return { events: allEvents, latestLedger: lowestLatestLedger };
 }
 
 // ─── Network tip helper ───────────────────────────────────────────────────────
@@ -309,8 +345,8 @@ export async function fetchEventsSafe(
   // If the range is a single ledger and it fails, skip it.
   if (startLedger >= endLedger) {
     try {
-      const { events, maxEventLedger } = await _fetchFn(startLedger, contractIds, limit, network);
-      return { events, highestLedger: Math.min(Math.max(startLedger, maxEventLedger), endLedger) };
+      const { events, latestLedger } = await _fetchFn(startLedger, contractIds, limit, network);
+      return { events, highestLedger: Math.max(startLedger, latestLedger) };
     } catch (err) {
       if (!isXdrError(err)) throw err;
       console.warn(`[rpc] Skipping ledger ${startLedger} — XDR decode error: ${(err as Error).message}`);
@@ -320,35 +356,10 @@ export async function fetchEventsSafe(
       return { events: [], highestLedger: startLedger };
     }
   }
-  // Page through the range with the RPC cursor until drained or the page budget is hit.
-  const MAX_PAGES = 100;
 
   try {
-    const allEvents: RawEvent[] = [];
-    let cursor: string | undefined;
-    let maxSeen = startLedger - 1;
-    let pages = 0;
-    let drained = false;
-    while (pages < MAX_PAGES) {
-      const page = cursor
-        ? await _fetchFn(startLedger, contractIds, limit, network, cursor)
-        : await _fetchFn(startLedger, contractIds, limit, network);
-      pages++;
-      allEvents.push(...page.events);
-      if (page.maxEventLedger > maxSeen) maxSeen = page.maxEventLedger;
-      if (!page.pageFull || !page.cursor) {
-        drained = true;
-        break;
-      }
-      cursor = page.cursor;
-    }
-    // Only ledgers whose events are fully returned are safe to commit. If the
-    // page budget ran out mid-range, stop at the last fully covered ledger.
-    const fullyCovered = drained ? endLedger : Math.max(startLedger, maxSeen);
-    return {
-      events: allEvents,
-      highestLedger: Math.min(fullyCovered, endLedger),
-    };
+    const { events, latestLedger } = await _fetchFn(startLedger, contractIds, limit, network);
+    return { events, highestLedger: latestLedger };
   } catch (err) {
     if (!isXdrError(err)) throw err;
 

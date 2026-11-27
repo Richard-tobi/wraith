@@ -203,6 +203,45 @@ export async function upsertTransfers(
   return result.count;
 }
 
+/**
+ * Idempotently insert a batch of transfer events and return only the records
+ * that were newly persisted (#367).
+ *
+ * Uses a single `INSERT ... ON CONFLICT DO NOTHING RETURNING "eventId"`
+ * statement via Prisma's `createManyAndReturn` so downstream steps
+ * (`upsertAccountSummaries`, live emitters) operate exclusively on rows that
+ * actually entered `TokenTransfer`, preventing double-counting and duplicate
+ * notifications on overlapping replays without extra round-trips.
+ */
+export async function upsertTransfersReturning(
+  records: TransferRecord[],
+  network?: Network
+): Promise<TransferRecord[]> {
+  if (records.length === 0) return [];
+  const net = resolveNetwork(network);
+
+  const inserted = await observeDbQuery("upsertTransfersReturning", () =>
+    prisma.tokenTransfer.createManyAndReturn({
+      data: records.map((r) => ({ ...r, network: net })),
+      skipDuplicates: true,
+      select: { eventId: true },
+    })
+  );
+
+  if (inserted.length === 0) return [];
+
+  // Consume each returned eventId once so duplicate eventIds within the same
+  // batch are only forwarded once, matching Postgres ON CONFLICT DO NOTHING.
+  const insertedIds = new Set(inserted.map((row) => row.eventId));
+  const insertedRecords: TransferRecord[] = [];
+  for (const record of records) {
+    if (insertedIds.delete(record.eventId)) {
+      insertedRecords.push(record);
+    }
+  }
+  return insertedRecords;
+}
+
 // ─── Indexer state helpers ─────────────────────────────────────────────────
 /**
  * Read the last indexed ledger from DB.

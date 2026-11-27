@@ -262,6 +262,20 @@ export const transfersStoredTotal = new Counter({
   registers: [registry],
 });
 
+/** Outcomes for token metadata cache and RPC lookups; labels are fixed and bounded. */
+export type TokenMetadataLookupOutcome =
+  | "hit"
+  | "miss"
+  | "failed"
+  | "skipped_recent_failure";
+
+export const tokenMetadataLookupsTotal = new Counter({
+  name: "token_metadata_lookups_total",
+  help: "Token metadata lookup outcomes",
+  labelNames: ["outcome"] as const,
+  registers: [registry],
+});
+
 /**
  * Failed RPC attempts, counted per attempt rather than per call.
  *
@@ -612,6 +626,25 @@ export const feeQuoteRecordFailuresTotal = new Counter({
   name: "veil_fee_quote_record_failures_total",
   help: "Fee quotes that could not be written to the fee ledger",
   labelNames: ["network"] as const,
+  registers: [registry],
+});
+
+/**
+ * Discord 429 answers, by the kind of call that got them.
+ *
+ * The bot's role sync is a long chain of single calls, so a rate limit in the
+ * middle is how a member ends up with half their roles. Counted the moment the
+ * 429 arrives — whether or not our retry absorbed it — because the question is
+ * how often Discord pushes us back.
+ *
+ * `kind` is one of five words from `DISCORD_CALL_KINDS`, never a path: a path
+ * carries a guild id, a user id and a role id, and an unbounded label makes
+ * /metrics grow until it cannot be scraped.
+ */
+export const discordRateLimitedTotal = new Counter({
+  name: "discord_rate_limited_total",
+  help: "Discord API 429 responses, by kind of call",
+  labelNames: ["kind"] as const,
   registers: [registry],
 });
 
